@@ -3,16 +3,13 @@ import cv2
 import numpy as np
 import mvsdk
 import time
-import serial
+import platform
 
 class App(object):
 	def __init__(self):
 		super(App, self).__init__()
 		self.pFrameBuffer = 0
 		self.quit = False
-		self.serial_port = serial.Serial('/dev/ttyCH341USB0', 115200)  # 初始化串口通信
-		self.serial_port.flushInput()  # 清空输入缓冲区
-		self.serial_port.flushOutput()  # 清空输出缓冲区
 
 	def main(self):
 		# 枚举相机
@@ -86,6 +83,11 @@ class App(object):
 
 		mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
 		mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+
+		# windows下取到的图像数据是上下颠倒的，以BMP格式存放。转换成opencv则需要上下翻转成正的
+		# linux下直接输出正的，不需要上下翻转
+		if platform.system() == "Windows":
+			mvsdk.CameraFlipFrameBuffer(pFrameBuffer, FrameHead, 1)
 		
 		# 此时图片已经存储在pFrameBuffer中，对于彩色相机pFrameBuffer=RGB数据，黑白相机pFrameBuffer=8位灰度数据
 		# 把pFrameBuffer转换成opencv的图像格式以进行后续算法处理
@@ -94,49 +96,7 @@ class App(object):
 		frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, 1 if FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8 else 3) )
 
 		frame = cv2.resize(frame, (640,480), interpolation = cv2.INTER_LINEAR)
-		# cv2.imshow("Press q to end", frame)
-		# if (cv2.waitKey(1) & 0xFF) == ord('q'):
-		# 	self.quit = True
-
-		# 转换为灰度图像（如果是彩色相机）
-		gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.shape[2] == 3 else frame
-
-        # 以253为参数进行二值化
-		_, binary = cv2.threshold(gray_frame, 253, 255, cv2.THRESH_BINARY)
-
-		# 检测轮廓
-		contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-		# 找到面积最大的轮廓
-		if contours:
-			largest_contour = max(contours, key=cv2.contourArea)
-
-			if len(largest_contour) >= 5:
-				ellipse = cv2.fitEllipse(largest_contour)
-				center = (int(ellipse[0][0]), int(ellipse[0][1]))
-
-				cv2.ellipse(frame, ellipse, (255, 0, 0), 2)
-				cv2.circle(frame, center, 5, (0, 0, 255), -1)
-				cv2.putText(frame, f"Center: {center}", (center[0] + 10, center[1] - 10),
-							cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-				# 计算圆心与图像中心的x坐标偏移量
-				image_center_x = frame.shape[1] // 2
-				offset_x = center[0] - image_center_x
-				print(f"Offset X: {offset_x}")
-
-				# 根据偏移量向串口发送数据
-				if abs(offset_x) <= 5:
-					self.serial_port.write(b'2')  # 偏移量在区间内，发送0
-				elif offset_x < 0:
-					self.serial_port.write(b'1')  # 圆心在左边，发送-1
-				else:
-					self.serial_port.write(b'3')  # 圆心在右边，发送1
-
-		cv2.drawContours(frame, contours, -1, (0, 255, 0), 2)
-
-		frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
-		cv2.imshow("Press q to end", binary)
+		cv2.imshow("Press q to end", frame)
 		if (cv2.waitKey(1) & 0xFF) == ord('q'):
 			self.quit = True
 
@@ -146,7 +106,5 @@ def main():
 		app.main()
 	finally:
 		cv2.destroyAllWindows()
-		if app.serial_port.is_open:
-			app.serial_port.close()
 
 main()
