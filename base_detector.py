@@ -26,6 +26,7 @@ class App(object):
 		self.max_area = config["filter"]["max_area"]
 		self.offset_threshold = config["offset"]["threshold"]
 		self.circularity_threshold = config["circularity"]["default_threshold"]
+		self.center_offset = config["center"]["offset"]
 
 		
 
@@ -103,6 +104,7 @@ class App(object):
 			cv2.createTrackbar("Threshold", "Binary", 253, 255, self.setThreshold)
 			cv2.createTrackbar("Min Area Threshold", "Frame", 4000, 10000, self.setsMinAreaThreshold)
 			cv2.createTrackbar("Max Area Threshold", "Frame", 6000, 10000, self.setsMaxAreaThreshold)
+			cv2.createTrackbar("Center offset", "Frame", 21, 41, self.setsCenterThreshold)
 			self.init=1
 
 		FrameHead = pFrameHead[0]
@@ -143,7 +145,7 @@ class App(object):
 			# 避免除以零
 			if perimeter > 0:
 				circularity = 4 * np.pi * (area / (perimeter ** 2))
-				print(f"Circularity: {circularity}")
+				# print(f"Circularity: {circularity}")
 				if circularity > self.circularity_threshold and len(largest_contour) >= 5:
 					ellipse = cv2.fitEllipse(largest_contour)
 					center = (int(ellipse[0][0]), int(ellipse[0][1]))
@@ -154,9 +156,10 @@ class App(object):
 								cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
 					# 计算圆心与图像中心的x坐标偏移量
-					image_center_x = frame.shape[1] // 2
+					image_center_x = frame.shape[1] // 2 + self.center_offset
 					offset_x = center[0] - image_center_x
 					print(f"Offset X: {offset_x}")
+					print(f"Center Offset: {self.center_offset}")
 
 					if self.serial_enabled:
 						# 根据偏移量向串口发送数据
@@ -175,7 +178,7 @@ class App(object):
 						else:
 							print("3 for Right")
 
-					os.system('clear')
+					# os.system('clear')
 
 		cv2.drawContours(frame, contours, -1, (0, 255, 0), 2)
 
@@ -198,6 +201,8 @@ class App(object):
 	def setsMaxAreaThreshold(self,x):
 		self.max_area = cv2.getTrackbarPos('Max Area Threshold', 'Frame')
 
+	def setsCenterThreshold(self,x):
+		self.center_offset = cv2.getTrackbarPos('Center offset', 'Frame')-21
 def main():
 	# 读取配置文件
 	with open("config.yaml", "r") as file:
