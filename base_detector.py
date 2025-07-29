@@ -100,11 +100,11 @@ class App(object):
 		if self.init==0:
 			cv2.namedWindow("Frame")
 			cv2.namedWindow("Binary")
-			cv2.createTrackbar("Circularity Threshold", "Frame", 80, 100, self.setsCircularityThreshold)
-			cv2.createTrackbar("Threshold", "Binary", 253, 255, self.setThreshold)
-			cv2.createTrackbar("Min Area Threshold", "Frame", 4000, 10000, self.setsMinAreaThreshold)
-			cv2.createTrackbar("Max Area Threshold", "Frame", 6000, 10000, self.setsMaxAreaThreshold)
-			cv2.createTrackbar("Center offset", "Frame", 21, 41, self.setsCenterThreshold)
+			cv2.createTrackbar("Circularity Threshold", "Frame", int(self.circularity_threshold*100), 100, self.setsCircularityThreshold)
+			cv2.createTrackbar("Threshold", "Binary", self.threshold, 255, self.setThreshold)
+			cv2.createTrackbar("Min Area Threshold", "Frame", self.min_area, 10000, self.setsMinAreaThreshold)
+			cv2.createTrackbar("Max Area Threshold", "Frame", self.max_area, 10000, self.setsMaxAreaThreshold)
+			cv2.createTrackbar("Center offset", "Frame", self.center_offset, 41, self.setsCenterThreshold)
 			self.init=1
 
 		FrameHead = pFrameHead[0]
@@ -120,6 +120,7 @@ class App(object):
 		frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, 1 if FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8 else 3) )
 
 		frame = cv2.resize(frame, (640,480), interpolation = cv2.INTER_LINEAR)
+		# frame = cv2.imread("1.png")
 
 		# 转换为灰度图像（如果是彩色相机）
 		gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.shape[2] == 3 else frame
@@ -163,7 +164,7 @@ class App(object):
 
 					if self.serial_enabled:
 						# 根据偏移量向串口发送数据
-						if abs(offset_x) <= 5:
+						if abs(offset_x) <= self.offset_threshold:
 							self.serial_port.write(b'2')  # 偏移量在区间内，发送0x32
 						elif offset_x < 0:
 							self.serial_port.write(b'1')  # 圆心在左边，发送0x31
@@ -171,7 +172,7 @@ class App(object):
 							self.serial_port.write(b'3')  # 圆心在右边，发送0x33
 					else:
 						# 如果串口未启用，打印判断结果
-						if abs(offset_x) <= 5:
+						if abs(offset_x) <= self.offset_threshold:
 							print("2 for Center")
 						elif offset_x < 0:
 							print("1 for Left")

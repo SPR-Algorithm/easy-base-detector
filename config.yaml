@@ -7,14 +7,14 @@ binary:
   default_threshold: 253
 
 circularity:
-  default_threshold: 0.8  # 圆度阈值
+  default_threshold: 0.75  # 圆度阈值
 
 filter:
-  min_area: 2000  # 最小面积
-  max_area: 5000  # 最大面积
+  min_area: 50  # 最小面积
+  max_area: 300  # 最大面积
 
 offset:
-  threshold: 5  # 偏移量阈值
+  threshold: 5  # 容差
 
 center:
-  offset: 0  # 中心点偏移阈值
+  offset: 21  # 中心点偏移阈值
