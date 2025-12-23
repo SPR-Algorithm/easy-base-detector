@@ -1,3 +1,11 @@
+debug: true
+
+mode: "dart"
+
+camera:
+  type: "opencv"
+  id: 1
+
 serial:
   enabled: false
   port: "/dev/ttyCH341USB0"
@@ -13,8 +21,10 @@ filter:
   min_area: 50  # 最小面积
   max_area: 300  # 最大面积
 
-offset:
+chassis_control:
   threshold: 5  # 容差
 
-center:
-  offset: 21  # 中心点偏移阈值
+offset:
+  center: 21  # 中心点偏移阈值
+  dart_x: 0        # Dart模式用的 X 轴微调
+  dart_y: 0        # Dart模式用的 Y 轴微调

@@ -1,220 +1,305 @@
 #coding=utf-8
 import cv2
 import numpy as np
-import mvsdk
 import time
 import serial
 import yaml
 import os
 
+try:
+    import mvsdk
+except ImportError:
+    mvsdk = None
+    print("Warning: mvsdk not found. Only opencv mode is available.")
+
 class App(object):
-	def __init__(self,config):
-		super(App, self).__init__()
-		self.pFrameBuffer = 0
-		self.quit = False
-		self.init = 0
-		# 从配置中读取串口开关和参数
-		self.serial_enabled = config["serial"]["enabled"]
-		if self.serial_enabled:
-			self.serial_port = serial.Serial(config["serial"]["port"], config["serial"]["baudrate"])
-			self.serial_port.flushInput()
-			self.serial_port.flushOutput()
+    def __init__(self, config):
+        super(App, self).__init__()
+        self.config = config
+        self.pFrameBuffer = 0
+        self.quit = False
+        
+        # --- 读取配置 ---
+        self.debug = config.get("debug", True)
+        self.mode = config.get("mode", "chassis")
+        self.camera_type = config.get("camera", {}).get("type", "mvsdk")
+        self.camera_id = config.get("camera", {}).get("id", 0)
 
-		# 从配置中读取其他参数
-		self.threshold = config["binary"]["default_threshold"]
-		self.min_area = config["filter"]["min_area"]
-		self.max_area = config["filter"]["max_area"]
-		self.offset_threshold = config["offset"]["threshold"]
-		self.circularity_threshold = config["circularity"]["default_threshold"]
-		self.center_offset = config["center"]["offset"]
+        self.serial_enabled = config["serial"]["enabled"]
+        self.serial_port = None
+        if self.serial_enabled:
+            try:
+                self.serial_port = serial.Serial(config["serial"]["port"], config["serial"]["baudrate"])
+                self.serial_port.flushInput()
+                self.serial_port.flushOutput()
+            except Exception as e:
+                print(f"Serial Error: {e}")
+                self.serial_enabled = False
 
-		
+        self.threshold = config["binary"]["default_threshold"]
+        self.min_area = config["filter"]["min_area"]
+        self.max_area = config["filter"]["max_area"]
+        self.offset_threshold = config["chassis_control"]["threshold"]
+        self.circularity_threshold = config["circularity"]["default_threshold"]
+        
+        # 读取偏移量参数
+        self.center_offset = config["offset"]["center"]
+        self.dart_offset_x = config["offset"].get("dart_x", 0) # 默认为0
+        self.dart_offset_y = config["offset"].get("dart_y", 0) # 默认为0
 
-	def main(self):
-		# 枚举相机
-		DevList = mvsdk.CameraEnumerateDevice()
-		nDev = len(DevList)
-		if nDev < 1:
-			print("No camera was found!")
-			return
+    def setup_ui(self):
+        """ 初始化分离的窗口和滑动条 """
+        cv2.namedWindow("Monitor", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Monitor", 1280, 480)
 
-		for i, DevInfo in enumerate(DevList):
-			print("{}: {} {}".format(i, DevInfo.GetFriendlyName(), DevInfo.GetPortType()))
-		i = 0 if nDev == 1 else int(input("Select camera: "))
-		DevInfo = DevList[i]
-		print(DevInfo)
+        cv2.namedWindow("Settings", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Settings", 400, 400) # 稍微增加高度以容纳更多滑动条
 
-		# 打开相机
-		hCamera = 0
-		try:
-			hCamera = mvsdk.CameraInit(DevInfo, -1, -1)
-		except mvsdk.CameraException as e:
-			print("CameraInit Failed({}): {}".format(e.error_code, e.message) )
-			return
+        # 基础参数
+        cv2.createTrackbar("Threshold", "Settings", self.threshold, 255, self.setThreshold)
+        cv2.createTrackbar("Circularity", "Settings", int(self.circularity_threshold*100), 100, self.setsCircularityThreshold)
+        cv2.createTrackbar("Min Area", "Settings", self.min_area, 10000, self.setsMinAreaThreshold)
+        cv2.createTrackbar("Max Area", "Settings", self.max_area, 30000, self.setsMaxAreaThreshold)
+        
+        # 模式特定的参数
+        # Chassis Offset: 范围 -100 到 +100 (默认值+100作为中点)
+        cv2.createTrackbar("Chassis Offset", "Settings", self.center_offset + 100, 200, self.setsCenterThreshold)
+        
+        # Dart Offset X: 范围 -100 到 +100
+        cv2.createTrackbar("Dart Off X", "Settings", self.dart_offset_x + 100, 200, self.setDartOffsetX)
+        # Dart Offset Y: 范围 -100 到 +100
+        cv2.createTrackbar("Dart Off Y", "Settings", self.dart_offset_y + 100, 200, self.setDartOffsetY)
+        
+        print("UI Initialized")
 
-		# 获取相机特性描述
-		cap = mvsdk.CameraGetCapability(hCamera)
+    def check_ui_alive(self):
+        try:
+            if cv2.getWindowProperty("Settings", cv2.WND_PROP_VISIBLE) < 1:
+                self.setup_ui()
+        except:
+            self.setup_ui()
 
-		# 判断是黑白相机还是彩色相机
-		monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
+    def process_frame(self, frame):
+        frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
+        
+        if len(frame.shape) == 3:
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_frame = frame
+            if self.debug: 
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-		# 黑白相机让ISP直接输出MONO数据，而不是扩展成R=G=B的24位灰度
-		if monoCamera:
-			mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
-		else:
-			mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+        _, binary = cv2.threshold(gray_frame, self.threshold, 255, cv2.THRESH_BINARY)
 
-		# 相机模式切换成连续采集
-		mvsdk.CameraSetTriggerMode(hCamera, 0)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filtered_contours = [cnt for cnt in contours if self.min_area <= cv2.contourArea(cnt) <= self.max_area]
 
-		# 手动曝光，曝光时间30ms
-		mvsdk.CameraSetAeState(hCamera, 0)
-		mvsdk.CameraSetExposureTime(hCamera, 30 * 1000)
+        target_found = False
+        target_center = (0, 0)
+        ellipse = None
 
-		# 让SDK内部取图线程开始工作
-		mvsdk.CameraPlay(hCamera)
+        if filtered_contours:
+            largest_contour = max(filtered_contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
+            perimeter = cv2.arcLength(largest_contour, True)
 
-		# 计算RGB buffer所需的大小，这里直接按照相机的最大分辨率来分配
-		FrameBufferSize = cap.sResolutionRange.iWidthMax * cap.sResolutionRange.iHeightMax * (1 if monoCamera else 3)
+            if perimeter > 0:
+                circularity = 4 * np.pi * (area / (perimeter ** 2))
+                
+                if circularity > self.circularity_threshold and len(largest_contour) >= 5:
+                    target_found = True
+                    ellipse = cv2.fitEllipse(largest_contour)
+                    target_center = (int(ellipse[0][0]), int(ellipse[0][1]))
 
-		# 分配RGB buffer，用来存放ISP输出的图像
-		# 备注：从相机传输到PC端的是RAW数据，在PC端通过软件ISP转为RGB数据（如果是黑白相机就不需要转换格式，但是ISP还有其它处理，所以也需要分配这个buffer）
-		self.pFrameBuffer = mvsdk.CameraAlignMalloc(FrameBufferSize, 16)
+        # 执行业务逻辑
+        if target_found:
+            self.handle_logic(target_center, 640)
 
-		# 设置采集回调函数
-		self.quit = False
-		mvsdk.CameraSetCallbackFunction(hCamera, self.GrabCallback, 0)
+        # 可视化处理 (Debug)
+        if self.debug:
+            self.check_ui_alive()
+            
+            if target_found:
+                # 画出原始检测到的圆
+                cv2.ellipse(frame, ellipse, (255, 0, 0), 2)
+                cv2.circle(frame, target_center, 5, (0, 0, 255), -1)
+                
+                # 如果是 Dart 模式，额外画出经过 offset 修正后的目标点（绿色点），方便调试
+                if self.mode == "dart":
+                    corrected_x = target_center[0] + self.dart_offset_x
+                    corrected_y = target_center[1] + self.dart_offset_y
+                    cv2.circle(frame, (corrected_x, corrected_y), 5, (0, 255, 0), -1) # 绿色为修正点
+                    cv2.putText(frame, f"Raw:{target_center}", (10, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+                    cv2.putText(frame, f"Fix:{corrected_x},{corrected_y}", (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                else:
+                    cv2.putText(frame, f"Pos: {target_center}", (target_center[0] + 10, target_center[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            cv2.drawContours(frame, contours, -1, (0, 255, 0), 1)
 
-		# 等待退出
-		while not self.quit:
-			time.sleep(0.1)
+            binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+            cv2.putText(binary_bgr, "Binary View", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame, f"Mode: {self.mode.upper()}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-		# 关闭相机
-		mvsdk.CameraUnInit(hCamera)
+            combined_img = np.hstack([frame, binary_bgr])
+            cv2.line(combined_img, (640, 0), (640, 480), (255, 255, 0), 2)
 
-		# 释放帧缓存
-		mvsdk.CameraAlignFree(self.pFrameBuffer)
+            cv2.imshow("Monitor", combined_img)
+            
+            settings_bg = np.zeros((100, 400, 3), dtype=np.uint8)
+            cv2.putText(settings_bg, "Adjust Trackbars", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+            cv2.imshow("Settings", settings_bg)
+            
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                self.quit = True
+            
+            if cv2.getWindowProperty("Monitor", cv2.WND_PROP_VISIBLE) < 1:
+                self.quit = True
 
-	@mvsdk.method(mvsdk.CAMERA_SNAP_PROC)
-	def GrabCallback(self, hCamera, pRawData, pFrameHead, pContext):
-		if self.init==0:
-			cv2.namedWindow("Frame")
-			cv2.namedWindow("Binary")
-			cv2.createTrackbar("Circularity Threshold", "Frame", int(self.circularity_threshold*100), 100, self.setsCircularityThreshold)
-			cv2.createTrackbar("Threshold", "Binary", self.threshold, 255, self.setThreshold)
-			cv2.createTrackbar("Min Area Threshold", "Frame", self.min_area, 10000, self.setsMinAreaThreshold)
-			cv2.createTrackbar("Max Area Threshold", "Frame", self.max_area, 10000, self.setsMaxAreaThreshold)
-			cv2.createTrackbar("Center offset", "Frame", self.center_offset, 41, self.setsCenterThreshold)
-			self.init=1
+    def handle_logic(self, center, img_width):
+        x, y = center
+        
+        # --- Chassis Mode (保持原样) ---
+        if self.mode == "chassis":
+            image_center_x = img_width // 2 + self.center_offset
+            offset_x = x - image_center_x
+            
+            if self.serial_enabled and self.serial_port and self.serial_port.is_open:
+                if abs(offset_x) <= self.offset_threshold:
+                    self.serial_port.write(b'2')
+                elif offset_x < 0:
+                    self.serial_port.write(b'1')
+                else:
+                    self.serial_port.write(b'3')
+            else:
+                if self.debug:
+                    if abs(offset_x) <= self.offset_threshold:
+                        print(f"[Chassis] Center (Offset: {offset_x})")
+                    elif offset_x < 0:
+                        print(f"[Chassis] Left (Offset: {offset_x})")
+                    else:
+                        print(f"[Chassis] Right (Offset: {offset_x})")
 
-		FrameHead = pFrameHead[0]
-		pFrameBuffer = self.pFrameBuffer
+        # --- Dart Mode (修改后：应用 offset) ---
+        elif self.mode == "dart":
+            # 计算修正后的坐标
+            final_x = x + self.dart_offset_x
+            final_y = y + self.dart_offset_y
+            
+            if self.serial_enabled and self.serial_port and self.serial_port.is_open:
+                # 发送修正后的坐标
+                data_str = f"{final_x},{final_y}\n"
+                self.serial_port.write(data_str.encode('utf-8'))
+            else:
+                if self.debug:
+                    # 打印调试信息：原始 -> 修正
+                    print(f"[Dart] Raw:({x},{y}) | Offset:({self.dart_offset_x},{self.dart_offset_y}) -> Final:({final_x},{final_y})")
 
-		mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
-		mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+    def run(self):
+        if self.debug:
+            self.setup_ui()
+        else:
+            print("Running in HEADLESS mode (No GUI).")
 
-		# 此时图片已经存储在pFrameBuffer中，对于彩色相机pFrameBuffer=RGB数据，黑白相机pFrameBuffer=8位灰度数据
-		# 把pFrameBuffer转换成opencv的图像格式以进行后续算法处理
-		frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pFrameBuffer)
-		frame = np.frombuffer(frame_data, dtype=np.uint8)
-		frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, 1 if FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8 else 3) )
+        try:
+            if self.camera_type == "opencv":
+                self.run_opencv()
+            else:
+                self.run_mvsdk()
+        except KeyboardInterrupt:
+            self.quit = True
 
-		frame = cv2.resize(frame, (640,480), interpolation = cv2.INTER_LINEAR)
-		# frame = cv2.imread("1.png")
+    def run_opencv(self):
+        print(f"Starting OpenCV Camera (ID: {self.camera_id})...")
+        cap = cv2.VideoCapture(self.camera_id)
+        if not cap.isOpened(): return
+        while not self.quit:
+            ret, frame = cap.read()
+            if not ret: break
+            self.process_frame(frame)
+        cap.release()
 
-		# 转换为灰度图像（如果是彩色相机）
-		gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.shape[2] == 3 else frame
+    def run_mvsdk(self):
+        if mvsdk is None: return
+        DevList = mvsdk.CameraEnumerateDevice()
+        if len(DevList) < 1: return
+        DevInfo = DevList[0] 
+        
+        hCamera = 0
+        try:
+            hCamera = mvsdk.CameraInit(DevInfo, -1, -1)
+        except mvsdk.CameraException: return
 
-        # 以253为参数进行二值化
-		_, binary = cv2.threshold(gray_frame, self.threshold, 255, cv2.THRESH_BINARY)
+        cap = mvsdk.CameraGetCapability(hCamera)
+        monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
+        
+        if monoCamera:
+            mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+        else:
+            mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+            
+        mvsdk.CameraSetTriggerMode(hCamera, 0)
+        mvsdk.CameraSetAeState(hCamera, 0)
+        mvsdk.CameraSetExposureTime(hCamera, 30 * 1000)
+        mvsdk.CameraPlay(hCamera)
+        
+        FrameBufferSize = cap.sResolutionRange.iWidthMax * cap.sResolutionRange.iHeightMax * (1 if monoCamera else 3)
+        self.pFrameBuffer = mvsdk.CameraAlignMalloc(FrameBufferSize, 16)
+        
+        mvsdk.CameraSetCallbackFunction(hCamera, self.GrabCallback, 0)
+        while not self.quit: time.sleep(0.1)
+        mvsdk.CameraUnInit(hCamera)
+        mvsdk.CameraAlignFree(self.pFrameBuffer)
 
-		# 检测轮廓
-		contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    @mvsdk.method(mvsdk.CAMERA_SNAP_PROC) if mvsdk else lambda x: x
+    def GrabCallback(self, hCamera, pRawData, pFrameHead, pContext):
+        FrameHead = pFrameHead[0]
+        pFrameBuffer = self.pFrameBuffer
+        mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
+        mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+        
+        frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pFrameBuffer)
+        frame = np.frombuffer(frame_data, dtype=np.uint8)
+        frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, 1 if FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8 else 3) )
+        self.process_frame(frame)
 
-		# 根据面积筛选轮廓
-		filtered_contours = [cnt for cnt in contours if self.min_area <= cv2.contourArea(cnt) <= self.max_area]
+    # --- 滑动条回调函数 ---
+    def setThreshold(self, x):
+        self.threshold = x
+    def setsCircularityThreshold(self, x):
+        self.circularity_threshold = x / 100.0
+    def setsMinAreaThreshold(self, x):
+        self.min_area = x
+    def setsMaxAreaThreshold(self, x):
+        self.max_area = x
+    
+    # Chassis模式的 Offset 回调 (-100 ~ 100)
+    def setsCenterThreshold(self, x):
+        self.center_offset = x - 100
 
-		# 找到面积最大的轮廓
-		if filtered_contours:
-			largest_contour = max(filtered_contours, key=cv2.contourArea)
+    # Dart模式的 X Offset 回调 (-100 ~ 100)
+    def setDartOffsetX(self, x):
+        self.dart_offset_x = x - 100
 
+    # Dart模式的 Y Offset 回调 (-100 ~ 100)
+    def setDartOffsetY(self, x):
+        self.dart_offset_y = x - 100
 
-			#计算轮廓的面积和周长
-			area = cv2.contourArea(largest_contour)
-			perimeter = cv2.arcLength(largest_contour, True)
-
-			# 避免除以零
-			if perimeter > 0:
-				circularity = 4 * np.pi * (area / (perimeter ** 2))
-				# print(f"Circularity: {circularity}")
-				if circularity > self.circularity_threshold and len(largest_contour) >= 5:
-					ellipse = cv2.fitEllipse(largest_contour)
-					center = (int(ellipse[0][0]), int(ellipse[0][1]))
-
-					cv2.ellipse(frame, ellipse, (255, 0, 0), 2)
-					cv2.circle(frame, center, 5, (0, 0, 255), -1)
-					cv2.putText(frame, f"Center: {center}", (center[0] + 10, center[1] - 10),
-								cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-					# 计算圆心与图像中心的x坐标偏移量
-					image_center_x = frame.shape[1] // 2 + self.center_offset
-					offset_x = center[0] - image_center_x
-					print(f"Offset X: {offset_x}")
-					print(f"Center Offset: {self.center_offset}")
-
-					if self.serial_enabled:
-						# 根据偏移量向串口发送数据
-						if abs(offset_x) <= self.offset_threshold:
-							self.serial_port.write(b'2')  # 偏移量在区间内，发送0x32
-						elif offset_x < 0:
-							self.serial_port.write(b'1')  # 圆心在左边，发送0x31
-						else:
-							self.serial_port.write(b'3')  # 圆心在右边，发送0x33
-					else:
-						# 如果串口未启用，打印判断结果
-						if abs(offset_x) <= self.offset_threshold:
-							print("2 for Center")
-						elif offset_x < 0:
-							print("1 for Left")
-						else:
-							print("3 for Right")
-
-					# os.system('clear')
-
-		cv2.drawContours(frame, contours, -1, (0, 255, 0), 2)
-
-		frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
-
-		cv2.imshow("Frame", frame)
-		cv2.imshow("Binary", binary)
-		if (cv2.waitKey(1) & 0xFF) == ord('q'):
-			self.quit = True
-
-	def setThreshold(self,x):
-		self.threshold = cv2.getTrackbarPos('Threshold', 'Binary')
-	
-	def setsCircularityThreshold(self,x):
-		self.circularity_threshold = cv2.getTrackbarPos('Circularity Threshold', 'Frame')/100.0
-
-	def setsMinAreaThreshold(self,x):
-		self.min_area = cv2.getTrackbarPos('Min Area Threshold', 'Frame')
-	
-	def setsMaxAreaThreshold(self,x):
-		self.max_area = cv2.getTrackbarPos('Max Area Threshold', 'Frame')
-
-	def setsCenterThreshold(self,x):
-		self.center_offset = cv2.getTrackbarPos('Center offset', 'Frame')-21
 def main():
-	# 读取配置文件
-	with open("config.yaml", "r") as file:
-		config = yaml.safe_load(file)
-	try:
-		app = App(config)
-		app.main()
-		
-	finally:
-		cv2.destroyAllWindows()
-		if config["serial"]["enabled"] and app.serial_port.is_open:
-			app.serial_port.close()
+    if not os.path.exists("config.yaml"): return
+    with open("config.yaml", "r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    app = None
+    try:
+        app = App(config)
+        app.run()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        cv2.destroyAllWindows()
+        if app and app.serial_enabled and app.serial_port and app.serial_port.is_open:
+            app.serial_port.close()
 
-main()
+if __name__ == "__main__":
+    main()
